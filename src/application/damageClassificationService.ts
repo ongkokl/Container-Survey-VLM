@@ -3,6 +3,7 @@ import { CedexRepository, DamageVisualRule } from "../infrastructure/d1/cedexRep
 const MODEL="@cf/qwen/qwen3.8-27b";
 const MAX_COMPLETION_TOKENS=1200;
 const DAMAGE_REVIEW_THRESHOLD=0.8;
+const PAA_DISCONTINUITY_TRIGGER_CODES=new Set(["CO","PF","GD","DT"]);
 type AiRunner={run(model:string,input:unknown):Promise<unknown>};
 type Bucket={get(key:string):Promise<{arrayBuffer():Promise<ArrayBuffer>}|null>};
 type AnalysisStatus="SUGGESTED"|"ABSTAINED"|"INCOMPLETE"|"INVALID_RESPONSE";
@@ -233,6 +234,38 @@ Return only the final JSON object with selected_code (an allowed code or JSON nu
       }
     }
 
+    let discontinuityVerificationUsed=false;
+    let discontinuityVerificationResult:string|null=null;
+    if(equipment==="GP"&&allowed.componentCode==="PAA"&&targetCropImage&&selectedCode&&
+      PAA_DISCONTINUITY_TRIGGER_CODES.has(selectedCode)&&aiAllowedSet.has("CU")){
+      discontinuityVerificationUsed=true;
+      const verifyPrompt="Verify only whether the exact fine-reticle centre shows a real CUT through or sharply incised into the GP/PAA panel material.\n"+
+        `The initial classifier selected ${selectedCode}, but rust, paint loss, gouging or deformation can visually mask a cut.\n`+
+        "Return CU only when you can see a sharp linear opening/incision, severed sheet edge, or clear cut penetration at the reticle centre.\n"+
+        "Do NOT call superficial scratches, rust lines, coating loss, stains, shadows, seams, gouges without penetration, or cracks CU.\n"+
+        "If a true cut is not visually established, return NOT_CU. This is a conservative verification step, not a request to prefer CU.";
+      const verifyRaw=await this.ai.run(MODEL,{
+        messages:[{role:"user",content:[{type:"text",text:verifyPrompt},{type:"image_url",image_url:{url:targetCropImage}}]}],
+        max_completion_tokens:300,reasoning_effort:"low",temperature:0,
+        response_format:{type:"json_schema",json_schema:{name:"paa_cut_verification",strict:true,schema:{
+          type:"object",properties:{result:{type:"string",enum:["CU","NOT_CU"]},confidence:{type:"number",minimum:0,maximum:1},reason:{type:"string"}},
+          required:["result","confidence","reason"],additionalProperties:false
+        }}}
+      });
+      const verifyEnvelope=record(verifyRaw);
+      const verifyChoice=Array.isArray(verifyEnvelope?.choices)?record(verifyEnvelope.choices[0]):null;
+      const verifyMessage=record(verifyChoice?.message);
+      let verify:Record<string,unknown>|null=null;
+      if(typeof verifyMessage?.content==="string"){try{verify=record(JSON.parse(verifyMessage.content));}catch{}}
+      if(verify?.result==="CU"&&typeof verify.confidence==="number"&&verify.confidence>=0.8){
+        discontinuityVerificationResult="CU";
+        const previousCode=selectedCode;
+        selectedCode="CU"; selectedConfidence=verify.confidence;
+        needsReview=selectedConfidence<DAMAGE_REVIEW_THRESHOLD;
+        reason=typeof verify.reason==="string"?verify.reason.trim():"Verified cut penetration at the target.";
+        candidates=[{code:"CU",confidence:selectedConfidence,reason},...candidates.filter(x=>x.code!=="CU"&&x.code!==previousCode)].slice(0,3);
+      }else discontinuityVerificationResult="NOT_CU";
+    }
     const selectedRule=selectedDamageRule(visualRules,selectedCode);
     const result={
       componentCode:allowed.componentCode,
@@ -253,6 +286,8 @@ Return only the final JSON object with selected_code (an allowed code or JSON nu
       aiEligibleDamageCount:aiAllowedDamages.length,
       aiEligibleDamageCodes:aiAllowedCodes,
       excludedFromPhotoOnlyAi:allowedCodes.filter(code=>!aiAllowedSet.has(code)),
+      discontinuityVerificationUsed,
+      discontinuityVerificationResult,
       evidenceRequirement:selectedRule?.evidence_requirement??null,
       evidenceReviewRequired:selectedRule?.force_review===1,
       finishReason,
@@ -282,6 +317,8 @@ Return only the final JSON object with selected_code (an allowed code or JSON nu
         damageVisualRuleCodes:[...new Set(visualRules.map(rule=>rule.damage_code))],
         aiEligibleDamageCodes:aiAllowedCodes,
         excludedFromPhotoOnlyAi:allowedCodes.filter(code=>!aiAllowedSet.has(code)),
+        discontinuityVerificationUsed,
+        discontinuityVerificationResult,
         selectedEvidenceRequirement:selectedRule?.evidence_requirement??null,
         evidenceReviewRequired:selectedRule?.force_review===1,
         needsReview,
