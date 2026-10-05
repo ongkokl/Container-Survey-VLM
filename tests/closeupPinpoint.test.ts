@@ -669,4 +669,31 @@ describe("close-up pinpoint targeting",()=>{
       })
     }));
   });
+  it("verifies a possible PAA cut when corrosion initially outranks CU",async()=>{
+    const repo={
+      findingContext:vi.fn(async()=>({id:"f-cu",survey_id:"s-cu",container_face:"RIGHT",equipment_type:"GP",length_ft:40,observed_iso_code:"45G1"})),
+      damageCodesForFinding:vi.fn(async()=>({componentCode:"PAA",damages:[
+        {damage_code:"CU",damage_name:"Cut"},{damage_code:"CO",damage_name:"Corrosion"},{damage_code:"PF",damage_name:"Paint Failure"}
+      ]})),
+      findingPhoto:vi.fn(async(_id:string,role:string)=>role==="DAMAGE_CLOSEUP"?{id:"p-cu",r2_key:"cu.jpg",content_type:"image/jpeg"}:{id:"t-cu",r2_key:"target.jpg",content_type:"image/jpeg"}),
+      surveyorComponentPoint:vi.fn(async()=>({x:0.5,y:0.5})),
+      damageVisualRules:vi.fn(async()=>[
+        {damage_code:"CU",component_code:"PAA",visual_definition:"Cut through panel.",positive_cues:"Sharp opening.",negative_cues:"Not scratch.",confusable_with:"CO",evidence_requirement:"VISUAL",force_review:0,source_reference:"test"},
+        {damage_code:"CO",component_code:"PAA",visual_definition:"Corrosion.",positive_cues:"Rust.",negative_cues:"",confusable_with:"CU",evidence_requirement:"VISUAL",force_review:0,source_reference:"test"},
+        {damage_code:"PF",component_code:"PAA",visual_definition:"Paint failure.",positive_cues:"Paint loss.",negative_cues:"",confusable_with:"CU",evidence_requirement:"VISUAL",force_review:0,source_reference:"test"}
+      ]),
+      saveDamagePrediction:vi.fn(async()=>({predictionId:"pred-cu"}))
+    } as unknown as CedexRepository;
+    const ai={run:vi.fn()
+      .mockResolvedValueOnce({choices:[{finish_reason:"stop",message:{content:JSON.stringify({selected_code:"CO",confidence:0.7,needs_review:true,reason:"Rust dominates.",candidates:[{code:"CO",confidence:0.7,reason:"Rust."},{code:"CU",confidence:0.25,reason:"Possible opening."}]})}}]})
+      .mockImplementationOnce(async(_model:string,input:unknown)=>{
+        const request=input as {messages:Array<{content:Array<{type:string;text?:string}>}>};
+        const prompt=String(request.messages[0].content[0].text??"");
+        expect(prompt).toContain("real CUT"); expect(prompt).toContain("initial classifier selected CO"); expect(prompt).toContain("Return CU only");
+        return {choices:[{finish_reason:"stop",message:{content:JSON.stringify({result:"CU",confidence:0.91,reason:"Sharp linear opening with severed sheet edge at reticle centre."})}}]};
+      })};
+    const result=await new DamageClassificationService(repo,{get:vi.fn(async()=>imageObject())},ai).analyse("f-cu");
+    expect(ai.run).toHaveBeenCalledTimes(2); expect(result.selectedCode).toBe("CU"); expect(result.confidence).toBe(0.91);
+    expect(result.discontinuityVerificationUsed).toBe(true); expect(result.discontinuityVerificationResult).toBe("CU");
+  });
 });
